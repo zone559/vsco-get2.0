@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path"
 	"strconv"
@@ -20,6 +21,10 @@ import (
 const (
 	userAgent           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
 	authorizationToken  = "Bearer 7356455548d0a1d886db010883388d08be84d0c9"
+	maxRetries          = 100
+	retryDelay          = 10 * time.Second
+	pageDelayMin        = 3
+	pageDelayMax        = 5
 )
 
 var (
@@ -38,13 +43,13 @@ func NewHTTPClient() *HTTPClient {
 	// Set Firefox browser fingerprint
 	session.Browser = azuretls.Firefox
 	
-	// Set headers including authorization token
+	// Set headers including authorization token and referrer
 	session.OrderedHeaders = azuretls.OrderedHeaders{
 		{"User-Agent", userAgent},
 		{"Accept", "application/json, text/plain, */*"},
 		{"Accept-Language", "en-US,en;q=0.5"},
 		{"Authorization", authorizationToken},
-		{"Referer", baseURL},
+		{"Referer", "https://vsco.co/"},
 		{"Origin", baseURL},
 		{"DNT", "1"},
 		{"Connection", "keep-alive"},
@@ -71,8 +76,54 @@ func (c *HTTPClient) Get(url string) (*azuretls.Response, error) {
 	return c.session.Get(url)
 }
 
-// DownloadFileWithProgress downloads a file and shows progress with speed
-func (c *HTTPClient) DownloadFileWithProgress(url, filepath string, description string) error {
+// GetWithRetry attempts a request with retries on failure
+func (c *HTTPClient) GetWithRetry(url string) (*azuretls.Response, error) {
+	var lastErr error
+	var resp *azuretls.Response
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			fmt.Printf("\n⚠️  Rate limited? Retry attempt %d/%d in %v...\n", attempt, maxRetries, retryDelay)
+			time.Sleep(retryDelay)
+		}
+
+		resp, lastErr = c.session.Get(url)
+		if lastErr != nil {
+			fmt.Printf("Request error: %v\n", lastErr)
+			continue
+		}
+
+		// Check if response is HTML (rate limit page)
+		if len(resp.Body) > 0 && resp.Body[0] == '<' {
+			fmt.Printf("⚠️  Received HTML response (status %d) - possible rate limiting\n", resp.StatusCode)
+			fmt.Printf("Response preview: %s\n", string(resp.Body)[:min(200, len(resp.Body))])
+			lastErr = fmt.Errorf("received HTML instead of JSON")
+			continue
+		}
+
+		// Check for 429 rate limit status code
+		if resp.StatusCode == 429 {
+			fmt.Printf("⚠️  Rate limit hit (status 429)\n")
+			lastErr = fmt.Errorf("rate limited")
+			continue
+		}
+
+		// Check for other non-200 status codes
+		if resp.StatusCode != 200 {
+			fmt.Printf("⚠️  Bad status code: %d\n", resp.StatusCode)
+			lastErr = fmt.Errorf("bad status: %d", resp.StatusCode)
+			continue
+		}
+
+		// Success
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("failed after %d retries, last error: %v", maxRetries, lastErr)
+}
+
+// DownloadFile downloads a file without progress bar
+func (c *HTTPClient) DownloadFile(url, filepath string) error {
 	resp, err := c.session.Get(url)
 	if err != nil {
 		return err
@@ -82,55 +133,21 @@ func (c *HTTPClient) DownloadFileWithProgress(url, filepath string, description 
 		return fmt.Errorf("bad status: %d", resp.StatusCode)
 	}
 
-	// Get file size from response body length
-	size := len(resp.Body)
-	
-	// Create progress bar
-	bar := progressbar.NewOptions(size,
-		progressbar.OptionSetDescription(description),
-		progressbar.OptionSetWriter(os.Stdout),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetWidth(30),
-		progressbar.OptionThrottle(100*time.Millisecond),
-		progressbar.OptionShowCount(),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Printf("\n")
-		}),
-		progressbar.OptionSetRenderBlankState(true),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "█",
-			SaucerHead:    "█",
-			SaucerPadding: "░",
-			BarStart:      "|",
-			BarEnd:        "|",
-		}),
-	)
+	return os.WriteFile(filepath, resp.Body, 0644)
+}
 
-	// Write file with progress tracking
-	file, err := os.Create(filepath)
-	if err != nil {
-		return err
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	defer file.Close()
+	return b
+}
 
-	// Write data in chunks to show progress
-	chunkSize := 32 * 1024 // 32KB chunks
-	for i := 0; i < len(resp.Body); i += chunkSize {
-		end := i + chunkSize
-		if end > len(resp.Body) {
-			end = len(resp.Body)
-		}
-		
-		chunk := resp.Body[i:end]
-		_, err = file.Write(chunk)
-		if err != nil {
-			return err
-		}
-		
-		bar.Add(len(chunk))
-	}
-
-	return nil
+// randomDelay sleeps for a random duration between min and max seconds
+func randomDelay(minSec, maxSec int) {
+	delay := time.Duration(rand.Intn(maxSec-minSec+1)+minSec) * time.Second
+	fmt.Printf("⏳ Waiting %v before next page request...\n", delay)
+	time.Sleep(delay)
 }
 
 // ========== Scraper Types ==========
@@ -164,10 +181,15 @@ type Scraper struct {
 	id              int
 	profileImageID  string
 	downloadDir     string
+	completedChan   chan string
+	progressBar     *progressbar.ProgressBar
 }
 
 // ========== Scraper Implementation ==========
 func NewScraper(username string, numWorkers int) *Scraper {
+	// Initialize random seed
+	rand.Seed(time.Now().UnixNano())
+	
 	// Create downloads directory
 	downloadDir := "downloads"
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
@@ -175,10 +197,11 @@ func NewScraper(username string, numWorkers int) *Scraper {
 	}
 
 	return &Scraper{
-		httpClient:  NewHTTPClient(),
-		username:    username,
-		numWorkers:  numWorkers,
-		downloadDir: downloadDir,
+		httpClient:    NewHTTPClient(),
+		username:      username,
+		numWorkers:    numWorkers,
+		downloadDir:   downloadDir,
+		completedChan: make(chan string, 100),
 	}
 }
 
@@ -186,24 +209,22 @@ func (s *Scraper) Close() {
 	if s.httpClient != nil {
 		s.httpClient.Close()
 	}
+	close(s.completedChan)
 }
 
 func (s *Scraper) GetUserInfo() error {
 	url := fmt.Sprintf("%s/2.0/sites?subdomain=%s", apiURL, s.username)
 
-	resp, err := s.httpClient.Get(url)
+	resp, err := s.httpClient.GetWithRetry(url)
 	if err != nil {
 		return fmt.Errorf("failed getting user info for user %s: %w", s.username, err)
-	}
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("failed to get user info for user %s: Status %d %s", s.username, resp.StatusCode, resp.Status)
 	}
 
 	var body sitesResponse
 	err = json.Unmarshal(resp.Body, &body)
 	if err != nil {
-		return fmt.Errorf("failed to decode JSON response for user info %s: %w", s.username, err)
+		return fmt.Errorf("failed to decode JSON response for user info %s: %w\nResponse preview: %s", 
+			s.username, err, string(resp.Body)[:min(200, len(resp.Body))])
 	}
 
 	if len(body.Sites) < 1 {
@@ -224,7 +245,7 @@ func (s *Scraper) fetchImageList() (imageList, error) {
 	for {
 		url := fmt.Sprintf("%s/2.0/medias?site_id=%d&page=%d", apiURL, s.id, page)
 
-		resp, err := s.httpClient.Get(url)
+		resp, err := s.httpClient.GetWithRetry(url)
 		if err != nil {
 			return imageList{}, fmt.Errorf("failed to get image list for user %s (page %d): %w", s.username, page, err)
 		}
@@ -232,7 +253,13 @@ func (s *Scraper) fetchImageList() (imageList, error) {
 		var curPage imageList
 		err = json.Unmarshal(resp.Body, &curPage)
 		if err != nil {
-			return imageList{}, fmt.Errorf("failed to decode JSON imagelist response for user %s: %w", s.username, err)
+			// Print the response preview for debugging
+			preview := string(resp.Body)
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			return imageList{}, fmt.Errorf("failed to decode JSON for user %s page %d: %w\nResponse preview:\n%s", 
+				s.username, page, err, preview)
 		}
 
 		list.Media = append(list.Media, curPage.Media...)
@@ -245,6 +272,11 @@ func (s *Scraper) fetchImageList() (imageList, error) {
 		}
 		
 		page++
+		
+		// Add random delay between page requests (3-5 seconds)
+		if len(curPage.Media) > 0 {
+			randomDelay(pageDelayMin, pageDelayMax)
+		}
 	}
 
 	return list, nil
@@ -282,6 +314,17 @@ func getMediaFilename(media Media) (string, error) {
 	return fmt.Sprintf("%s%s", media.ID, ext), nil
 }
 
+// displayCompletedMessages shows completed messages above the progress bar
+func (s *Scraper) displayCompletedMessages() {
+	for msg := range s.completedChan {
+		// Clear the current line and move up
+		fmt.Print("\033[K\033[A")
+		fmt.Println(msg)
+		// Redraw progress bar
+		s.progressBar.RenderBlank()
+	}
+}
+
 func (s *Scraper) SaveMediaToFile(media Media, folderPath string) error {
 	mediaUrl := getCorrectUrl(media)
 	mediaUrl = fixUrl(mediaUrl)
@@ -295,18 +338,12 @@ func (s *Scraper) SaveMediaToFile(media Media, folderPath string) error {
 
 	// Skip if file already exists
 	if _, err := os.Stat(mediaPath); err == nil {
-		fmt.Printf("Skipping existing file: %s\n", mediaFile)
+		s.completedChan <- fmt.Sprintf("⏭️  Skipped existing: %s", mediaFile)
+		s.progressBar.Add(1)
 		return nil
 	}
 
-	// Show file type in description
-	fileType := "Image"
-	if media.Is_video {
-		fileType = "Video"
-	}
-	description := fmt.Sprintf("%s %s", fileType, media.ID[:8])
-
-	err = s.httpClient.DownloadFileWithProgress(mediaUrl, mediaPath, description)
+	err = s.httpClient.DownloadFile(mediaUrl, mediaPath)
 	if err != nil {
 		return fmt.Errorf("failed to download media: %w", err)
 	}
@@ -315,6 +352,8 @@ func (s *Scraper) SaveMediaToFile(media Media, folderPath string) error {
 	imageTime := time.Unix(media.Upload_date/1000, 0)
 	os.Chtimes(mediaPath, imageTime, imageTime)
 
+	s.completedChan <- fmt.Sprintf("✅ Completed: %s", mediaFile)
+	s.progressBar.Add(1)
 	return nil
 }
 
@@ -330,21 +369,21 @@ func (s *Scraper) SaveProfilePicture() error {
 	
 	// Skip if already exists
 	if _, err := os.Stat(profilePath); err == nil {
-		fmt.Printf("Profile picture already exists: %s\n", profileFilename)
+		fmt.Printf("⏭️  Profile picture already exists: %s\n", profileFilename)
 		return nil
 	}
 
-	fmt.Printf("\nDownloading profile picture for %s...\n", s.username)
+	fmt.Printf("⬇️  Downloading profile picture: %s\n", profileFilename)
 	
 	// Construct the profile image URL using the ID
 	profileURL := fmt.Sprintf("https://i.vsco.co/%s", s.profileImageID)
 
-	err = s.httpClient.DownloadFileWithProgress(profileURL, profilePath, "Profile")
+	err = s.httpClient.DownloadFile(profileURL, profilePath)
 	if err != nil {
 		return fmt.Errorf("failed to download profile picture: %w", err)
 	}
 
-	fmt.Printf("Downloaded profile picture: %s\n\n", profileFilename)
+	fmt.Printf("✅ Completed profile picture: %s\n\n", profileFilename)
 	return nil
 }
 
@@ -407,8 +446,30 @@ func (s *Scraper) SaveAllMedia() error {
 		return nil
 	}
 
-	fmt.Printf("\nDownloading %d media items from %s with %d workers...\n", len(imagelist.Media), s.username, s.numWorkers)
-	fmt.Println("(Progress bars show individual file downloads)\n")
+	fmt.Printf("\nDownloading %d media items from %s with %d workers...\n\n", len(imagelist.Media), s.username, s.numWorkers)
+
+	// Create a progress bar for overall progress
+	s.progressBar = progressbar.NewOptions(len(imagelist.Media),
+		progressbar.OptionSetDescription("Overall Progress"),
+		progressbar.OptionSetWriter(os.Stdout),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowBytes(false),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "█",
+			SaucerHead:    "█",
+			SaucerPadding: "░",
+			BarStart:      "|",
+			BarEnd:        "|",
+		}),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
+	// Start goroutine to display completed messages
+	go s.displayCompletedMessages()
 
 	// Concurrent downloads
 	var sem = make(chan int, s.numWorkers)
@@ -425,13 +486,13 @@ func (s *Scraper) SaveAllMedia() error {
 
 			err := s.SaveMediaToFile(media, userPath)
 			if err != nil {
-				log.Printf("Error downloading media for %s: %v", s.username, err)
+				log.Printf("❌ Error downloading media %s: %v", media.ID, err)
 			}
 		}(media)
 	}
 
 	wg.Wait()
-	fmt.Printf("\nCompleted downloads for %s\n", s.username)
+	fmt.Printf("\n🎉 Completed all downloads for %s\n", s.username)
 	return nil
 }
 
@@ -519,7 +580,7 @@ func main() {
 		// Get user info first
 		err := scraper.GetUserInfo()
 		if err != nil {
-			log.Printf("Error getting user info for %s: %v", username, err)
+			log.Printf("❌ Error getting user info for %s: %v", username, err)
 			scraper.Close()
 			continue
 		}
@@ -527,13 +588,13 @@ func main() {
 		// Download profile picture first
 		err = scraper.SaveProfilePicture()
 		if err != nil {
-			log.Printf("Error saving profile picture for %s: %v", username, err)
+			log.Printf("❌ Error saving profile picture for %s: %v", username, err)
 		}
 
 		// Then download all media
 		err = scraper.SaveAllMedia()
 		if err != nil {
-			log.Printf("Error saving media for %s: %v", username, err)
+			log.Printf("❌ Error saving media for %s: %v", username, err)
 		}
 		
 		scraper.Close()
@@ -541,7 +602,8 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("VSCO Image Scraper with Progress Bars")
+	fmt.Println("VSCO Image Scraper")
+	fmt.Println("====================")
 	fmt.Println("Usage:")
 	fmt.Println("  Single user: go run testzz.go username")
 	fmt.Println("  Multiple users: go run testzz.go -l usernames.txt")
@@ -549,4 +611,12 @@ func printUsage() {
 	fmt.Println("\nOptions:")
 	fmt.Println("  -l FILE    Scrape multiple usernames from a file (one per line)")
 	fmt.Println("  -w N       Number of concurrent workers (default: 5)")
+	fmt.Println("\nFeatures:")
+	fmt.Println("  ✅ Auto-downloads profile picture")
+	fmt.Println("  ✅ Shows full filenames during download")
+	fmt.Println("  ✅ Overall progress bar always at bottom")
+	fmt.Println("  ✅ Concurrent downloads")
+	fmt.Println("  ✅ Skips existing files")
+	fmt.Println("  ✅ Automatic retry on rate limit (100 attempts, 10s delay)")
+	fmt.Println("  ✅ 3-5 second delay between page requests")
 }
